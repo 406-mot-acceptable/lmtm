@@ -1,0 +1,38 @@
+# The Tunneler - Go Edition Configuration
+#
+# Minimal configuration for managing 800+ customer sites
+
+defaults:
+  username: "dato"
+  subnet: "10.0.0"
+  password_prompt: true
+
+sites:
+  # Basic site - just gateway info
+  # Devices default to 10.0.0.2-11 (--first-10 behavior)
+  - name: "Example Site A"
+    gateway: "102.217.230.33"
+    type: "ubiquiti"
+    favorite: true
+
+  # Site with custom username
+  - name: "Example Site B"
+    gateway: "198.51.100.45"
+    type: "mikrotik"
+    username: "datonetfullaccess"
+
+  # Site with custom device range
+  - name: "Example Site C (Large Network)"
+    gateway: "203.0.113.50"
+    type: "ubiquiti"
+    device_range:
+      start: 2
+      end: 30  # Tunnel to 10.0.0.2-30
+
+# Gateway Types:
+# - "ubiquiti": Adds -o HostKeyAlgorithm=ssh-rsa automatically
+# - "mikrotik": Standard SSH options
+
+# Port Mapping:
+# 10.0.0.X:443 → localhost:443X
+# Example: 10.0.0.2:443 → localhost:4432
