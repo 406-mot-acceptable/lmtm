@@ -1,4 +1,12 @@
-# LMTM -- Lean Mean Tunneling Machine
+```
+ ██╗     ███╗   ███╗████████╗███╗   ███╗
+ ██║     ████╗ ████║╚══██╔══╝████╗ ████║
+ ██║     ██╔████╔██║   ██║   ██╔████╔██║
+ ██║     ██║╚██╔╝██║   ██║   ██║╚██╔╝██║
+ ███████╗██║ ╚═╝ ██║   ██║   ██║ ╚═╝ ██║
+ ╚══════╝╚═╝     ╚═╝   ╚═╝   ╚═╝     ╚═╝
+ Lean Mean Tunneling Machine
+```
 
 Interactive SSH tunnel builder for MikroTik and Ubiquiti gateways. Connect to a gateway, discover LAN devices, pick what you want, and tunnels get built. No config files. No bookmarks. Just tunnels.
 
