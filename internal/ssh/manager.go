@@ -1,147 +1,179 @@
 package ssh
 
 import (
+	"context"
 	"fmt"
 	"sync"
-
-	"github.com/jaco/tunneler/internal/config"
+	"time"
 )
 
-// Manager manages multiple site tunnels
+// EventType describes what happened to a tunnel.
+type EventType int
+
+const (
+	EventStarted EventType = iota
+	EventActive
+	EventFailed
+	EventClosed
+)
+
+// String returns a human-readable event type.
+func (e EventType) String() string {
+	switch e {
+	case EventStarted:
+		return "started"
+	case EventActive:
+		return "active"
+	case EventFailed:
+		return "failed"
+	case EventClosed:
+		return "closed"
+	default:
+		return "unknown"
+	}
+}
+
+// TunnelEvent is emitted by the Manager as tunnels change state.
+// The TUI subscribes to these events to drive the build animation.
+type TunnelEvent struct {
+	Tunnel *Tunnel
+	Type   EventType
+}
+
+// TunnelSpec describes a single port forward to build.
+type TunnelSpec struct {
+	RemoteHost string
+	RemotePort int
+	LocalPort  int
+}
+
+// Manager coordinates multiple tunnels on a single SSH connection.
+// It provides an event channel that the TUI can consume to animate
+// tunnel construction.
 type Manager struct {
-	activeSites map[string]*SiteTunnel // siteName -> SiteTunnel
-	password    string
-	mu          sync.RWMutex
+	client   *Client
+	tunnels  []*Tunnel
+	mu       sync.RWMutex
+	eventCh  chan TunnelEvent
+	closed   bool     // guards eventCh against send-after-close panic
+	closeMu  sync.Mutex
+	cancelFn context.CancelFunc // cancels BuildTunnels goroutine
+	buildCtx context.Context
 }
 
-// NewManager creates a new tunnel manager
-func NewManager() *Manager {
+// NewManager creates a tunnel manager for the given SSH client.
+// eventChSize controls the buffer size of the event channel.
+func NewManager(client *Client, eventChSize int) *Manager {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
-		activeSites: make(map[string]*SiteTunnel),
+		client:   client,
+		eventCh:  make(chan TunnelEvent, eventChSize),
+		cancelFn: cancel,
+		buildCtx: ctx,
 	}
 }
 
-// SetPassword sets the cached password
-func (m *Manager) SetPassword(password string) {
-	m.password = password
+// Events returns a read-only channel of tunnel lifecycle events.
+func (m *Manager) Events() <-chan TunnelEvent {
+	return m.eventCh
 }
 
-// ConnectSite connects to a site and sets up all device tunnels
-func (m *Manager) ConnectSite(site *config.Site, devices []config.Device, defaults config.Defaults, statusCallback func(*TunnelInfo)) error {
-	m.mu.Lock()
-	// Close existing connection if any
-	if existing, ok := m.activeSites[site.Name]; ok {
-		existing.Disconnect()
-		delete(m.activeSites, site.Name)
-	}
-	m.mu.Unlock()
-
-	// Create new site tunnel
-	siteTunnel := NewSiteTunnel(
-		site.Name,
-		site.Gateway,
-		site.GetUsername(defaults),
-		m.password,
-		site.GetSSHOptions(),
-	)
-
-	if statusCallback != nil {
-		siteTunnel.SetStatusCallback(statusCallback)
+// BuildTunnels creates and starts tunnels for each spec sequentially.
+// It emits EventStarted before each tunnel starts, then EventActive
+// or EventFailed depending on the outcome. A small delay between
+// tunnels gives the TUI animation time to render each pipe.
+// The build loop is cancelled if CloseAll is called concurrently.
+func (m *Manager) BuildTunnels(specs []TunnelSpec) error {
+	if len(specs) == 0 {
+		return fmt.Errorf("tunnel: no specs provided")
 	}
 
-	// Connect
-	if err := siteTunnel.Connect(devices); err != nil {
-		return err
-	}
+	var firstErr error
 
-	m.mu.Lock()
-	m.activeSites[site.Name] = siteTunnel
-	m.mu.Unlock()
-
-	return nil
-}
-
-// DisconnectSite disconnects a specific site
-func (m *Manager) DisconnectSite(siteName string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if siteTunnel, ok := m.activeSites[siteName]; ok {
-		if err := siteTunnel.Disconnect(); err != nil {
-			return err
+	for _, spec := range specs {
+		// Check if we've been cancelled (CloseAll called during build).
+		select {
+		case <-m.buildCtx.Done():
+			return fmt.Errorf("tunnel: build cancelled")
+		default:
 		}
-		delete(m.activeSites, siteName)
+
+		tun := NewTunnel(m.client, spec.LocalPort, spec.RemoteHost, spec.RemotePort)
+
+		m.mu.Lock()
+		m.tunnels = append(m.tunnels, tun)
+		m.mu.Unlock()
+
+		m.emit(TunnelEvent{Tunnel: tun, Type: EventStarted})
+
+		if err := tun.Start(); err != nil {
+			m.emit(TunnelEvent{Tunnel: tun, Type: EventFailed})
+			if firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			m.emit(TunnelEvent{Tunnel: tun, Type: EventActive})
+		}
+
+		// Small delay between tunnels for TUI animation pacing.
+		time.Sleep(50 * time.Millisecond)
 	}
 
-	return nil
+	return firstErr
 }
 
-// DisconnectAll disconnects all active sites
-func (m *Manager) DisconnectAll() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for _, siteTunnel := range m.activeSites {
-		siteTunnel.Disconnect()
-	}
-
-	m.activeSites = make(map[string]*SiteTunnel)
-	return nil
-}
-
-// GetAllTunnels returns all active tunnels across all sites
-func (m *Manager) GetAllTunnels() map[string][]*TunnelInfo {
+// Tunnels returns a snapshot of all managed tunnels.
+func (m *Manager) Tunnels() []*Tunnel {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-
-	result := make(map[string][]*TunnelInfo)
-	for siteName, siteTunnel := range m.activeSites {
-		result[siteName] = siteTunnel.GetTunnels()
-	}
-
+	result := make([]*Tunnel, len(m.tunnels))
+	copy(result, m.tunnels)
 	return result
 }
 
-// IsSiteConnected checks if a site is connected
-func (m *Manager) IsSiteConnected(siteName string) bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+// CloseAll stops all tunnels, emits EventClosed for each, closes
+// the event channel, and closes the underlying SSH client.
+// Safe to call while BuildTunnels is running in a goroutine.
+func (m *Manager) CloseAll() error {
+	// Cancel any in-progress BuildTunnels goroutine first.
+	m.cancelFn()
 
-	if siteTunnel, ok := m.activeSites[siteName]; ok {
-		return siteTunnel.IsConnected()
+	m.mu.Lock()
+	tunnels := make([]*Tunnel, len(m.tunnels))
+	copy(tunnels, m.tunnels)
+	m.mu.Unlock()
+
+	var firstErr error
+	for _, tun := range tunnels {
+		if err := tun.Stop(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		m.emit(TunnelEvent{Tunnel: tun, Type: EventClosed})
 	}
 
-	return false
+	// Mark closed before closing the channel to prevent send-after-close panic.
+	m.closeMu.Lock()
+	m.closed = true
+	close(m.eventCh)
+	m.closeMu.Unlock()
+
+	if err := m.client.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+
+	return firstErr
 }
 
-// QuickConnect creates a quick tunnel without config file
-func (m *Manager) QuickConnect(gateway, username, password, gatewayType string, subnet string, start, end int, statusCallback func(*TunnelInfo)) error {
-	// Generate devices
-	devices := make([]config.Device, 0, end-start+1)
-	for i := start; i <= end; i++ {
-		ip := fmt.Sprintf("%s.%d", subnet, i)
-		device := config.Device{
-			IP:        ip,
-			Name:      fmt.Sprintf("Device %d", i),
-			Port:      443,
-			LocalPort: 4430 + i,
-		}
-		devices = append(devices, device)
+// emit sends a tunnel event without blocking. If the channel buffer
+// is full or the channel has been closed, the event is dropped.
+func (m *Manager) emit(ev TunnelEvent) {
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	if m.closed {
+		return
 	}
-
-	// Create temporary site config
-	site := &config.Site{
-		Name:     fmt.Sprintf("Quick: %s", gateway),
-		Gateway:  gateway,
-		Type:     gatewayType,
-		Username: username,
+	select {
+	case m.eventCh <- ev:
+	default:
 	}
-
-	// Create minimal defaults (QuickConnect already has username)
-	defaults := config.Defaults{
-		Username: username,
-		Subnet:   subnet,
-	}
-
-	return m.ConnectSite(site, devices, defaults, statusCallback)
 }

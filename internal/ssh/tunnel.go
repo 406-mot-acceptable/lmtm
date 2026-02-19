@@ -5,15 +5,11 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sync"
+	"sync/atomic"
 	"time"
-
-	"golang.org/x/crypto/ssh"
-
-	"github.com/jaco/tunneler/internal/config"
 )
 
-// TunnelStatus represents the status of a tunnel
+// TunnelStatus represents the current state of a tunnel.
 type TunnelStatus int
 
 const (
@@ -23,6 +19,7 @@ const (
 	StatusFailed
 )
 
+// String returns a human-readable tunnel status.
 func (s TunnelStatus) String() string {
 	switch s {
 	case StatusDisconnected:
@@ -38,300 +35,157 @@ func (s TunnelStatus) String() string {
 	}
 }
 
-// TunnelInfo contains information about a tunnel
-type TunnelInfo struct {
-	DeviceName string
-	DeviceIP   string
-	DevicePort int
+// Tunnel manages a single local-to-remote port forward over an SSH connection.
+// It listens on 127.0.0.1:LocalPort and forwards accepted connections through
+// the SSH client to RemoteHost:RemotePort.
+type Tunnel struct {
 	LocalPort  int
+	RemoteHost string
+	RemotePort int
 	Status     TunnelStatus
 	Error      error
-}
 
-// SiteTunnel manages tunnels for a single site
-type SiteTunnel struct {
-	SiteName   string
-	Gateway    string
-	Username   string
-	Password   string
-	SSHOptions []string
-
-	client    *ssh.Client
-	tunnels   map[int]*TunnelInfo // localPort -> TunnelInfo
-	listeners []net.Listener
+	listener  net.Listener
+	client    *Client
 	ctx       context.Context
 	cancel    context.CancelFunc
-	mu        sync.RWMutex
-	wg        sync.WaitGroup
-
-	statusCallback func(*TunnelInfo)
+	connCount int64 // atomic: number of active forwarded connections
 }
 
-// NewSiteTunnel creates a new site tunnel manager
-func NewSiteTunnel(siteName, gateway, username, password string, sshOptions []string) *SiteTunnel {
+// NewTunnel creates a tunnel that will forward from localhost:localPort
+// through the SSH client to remoteHost:remotePort.
+func NewTunnel(client *Client, localPort int, remoteHost string, remotePort int) *Tunnel {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &SiteTunnel{
-		SiteName:   siteName,
-		Gateway:    gateway,
-		Username:   username,
-		Password:   password,
-		SSHOptions: sshOptions,
-		tunnels:    make(map[int]*TunnelInfo),
+	return &Tunnel{
+		LocalPort:  localPort,
+		RemoteHost: remoteHost,
+		RemotePort: remotePort,
+		Status:     StatusDisconnected,
+		client:     client,
 		ctx:        ctx,
 		cancel:     cancel,
 	}
 }
 
-// SetStatusCallback sets the callback for status updates
-func (st *SiteTunnel) SetStatusCallback(cb func(*TunnelInfo)) {
-	st.statusCallback = cb
-}
+// Start begins listening on 127.0.0.1:LocalPort and forwarding connections.
+// It binds exclusively to loopback to prevent external access.
+func (t *Tunnel) Start() error {
+	t.Status = StatusConnecting
 
-// notifyStatus sends status update via callback
-func (st *SiteTunnel) notifyStatus(info *TunnelInfo) {
-	if st.statusCallback != nil {
-		st.statusCallback(info)
-	}
-}
-
-// Connect establishes SSH connection and sets up tunnels
-func (st *SiteTunnel) Connect(devices []config.Device) error {
-	// Update all tunnels to connecting status
-	st.mu.Lock()
-	for _, device := range devices {
-		info := &TunnelInfo{
-			DeviceName: device.Name,
-			DeviceIP:   device.IP,
-			DevicePort: device.Port,
-			LocalPort:  device.LocalPort,
-			Status:     StatusConnecting,
-		}
-		st.tunnels[device.LocalPort] = info
-		st.notifyStatus(info)
-	}
-	st.mu.Unlock()
-
-	// Build SSH client config
-	sshConfig := &ssh.ClientConfig{
-		User: st.Username,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(st.Password),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // TODO: Implement proper host key checking
-		Timeout:         10 * time.Second,
-	}
-
-	// Handle Ubiquiti ssh-rsa requirement
-	for i := 0; i < len(st.SSHOptions)-1; i++ {
-		if st.SSHOptions[i] == "-o" && st.SSHOptions[i+1] == "HostKeyAlgorithm=ssh-rsa" {
-			sshConfig.HostKeyAlgorithms = []string{"ssh-rsa"}
-			break
-		}
-	}
-
-	// Connect to gateway
-	client, err := ssh.Dial("tcp", st.Gateway+":22", sshConfig)
+	listenAddr := fmt.Sprintf("127.0.0.1:%d", t.LocalPort)
+	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		// Mark all tunnels as failed
-		st.mu.Lock()
-		for _, info := range st.tunnels {
-			info.Status = StatusFailed
-			info.Error = err
-			st.notifyStatus(info)
-		}
-		st.mu.Unlock()
-		return fmt.Errorf("failed to connect to gateway: %w", err)
+		t.Status = StatusFailed
+		t.Error = fmt.Errorf("tunnel: listen on %s: %w", listenAddr, err)
+		return t.Error
 	}
+	t.listener = ln
+	t.Status = StatusActive
 
-	st.client = client
-
-	// Set up port forwards for each device
-	for _, device := range devices {
-		if err := st.setupForward(device); err != nil {
-			// Mark this device as failed but continue with others
-			st.mu.Lock()
-			if info, ok := st.tunnels[device.LocalPort]; ok {
-				info.Status = StatusFailed
-				info.Error = err
-				st.notifyStatus(info)
-			}
-			st.mu.Unlock()
-		}
-	}
+	// Accept loop runs in background.
+	go t.acceptLoop()
 
 	return nil
 }
 
-// setupForward sets up a single port forward
-func (st *SiteTunnel) setupForward(device config.Device) error {
-	// Listen on local port
-	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", device.LocalPort))
-	if err != nil {
-		return fmt.Errorf("failed to listen on local port: %w", err)
-	}
-
-	st.listeners = append(st.listeners, listener)
-
-	// Update status to active
-	st.mu.Lock()
-	if info, ok := st.tunnels[device.LocalPort]; ok {
-		info.Status = StatusActive
-		st.notifyStatus(info)
-	}
-	st.mu.Unlock()
-
-	// Start accepting connections
-	st.wg.Add(1)
-	go st.handleForward(listener, device)
-
-	return nil
-}
-
-// handleForward handles forwarding for a single tunnel
-func (st *SiteTunnel) handleForward(listener net.Listener, device config.Device) {
-	defer st.wg.Done()
-	defer listener.Close()
-
+// acceptLoop accepts incoming connections on the local listener and
+// forwards each one through the SSH tunnel.
+func (t *Tunnel) acceptLoop() {
+	consecutiveErrors := 0
 	for {
-		select {
-		case <-st.ctx.Done():
-			return
-		default:
-			// Set accept deadline to allow periodic context checking
-			listener.(*net.TCPListener).SetDeadline(time.Now().Add(1 * time.Second))
-
-			localConn, err := listener.Accept()
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue // Deadline exceeded, check context and retry
-				}
+		conn, err := t.listener.Accept()
+		if err != nil {
+			// Listener closed (via Stop) -- exit cleanly.
+			select {
+			case <-t.ctx.Done():
+				return
+			default:
+			}
+			// Backoff on persistent accept errors to avoid tight spin.
+			consecutiveErrors++
+			if consecutiveErrors >= 10 {
+				t.Status = StatusFailed
+				t.Error = fmt.Errorf("tunnel: too many accept errors on port %d: %w", t.LocalPort, err)
 				return
 			}
-
-			// Connect to remote device through SSH
-			go st.forward(localConn, device)
+			time.Sleep(time.Duration(consecutiveErrors) * 50 * time.Millisecond)
+			continue
 		}
+		consecutiveErrors = 0
+		go t.forward(conn)
 	}
 }
 
-// forward handles a single connection forward
-func (st *SiteTunnel) forward(localConn net.Conn, device config.Device) {
-	defer localConn.Close()
+// forward connects the local connection to the remote host through the
+// SSH tunnel and copies data bidirectionally.
+func (t *Tunnel) forward(local net.Conn) {
+	atomic.AddInt64(&t.connCount, 1)
+	defer atomic.AddInt64(&t.connCount, -1)
+	defer local.Close()
 
-	remoteAddr := fmt.Sprintf("%s:%d", device.IP, device.Port)
-	remoteConn, err := st.client.Dial("tcp", remoteAddr)
+	remoteAddr := fmt.Sprintf("%s:%d", t.RemoteHost, t.RemotePort)
+	remote, err := t.client.Dial("tcp", remoteAddr)
 	if err != nil {
 		return
 	}
-	defer remoteConn.Close()
+	defer remote.Close()
 
-	// Bidirectional copy
+	// Bidirectional copy: two goroutines, done when either direction finishes.
+	// Buffer of 2 so neither goroutine blocks on send after the function returns.
 	done := make(chan struct{}, 2)
 
 	go func() {
-		io.Copy(remoteConn, localConn)
+		io.Copy(remote, local)
 		done <- struct{}{}
 	}()
 
 	go func() {
-		io.Copy(localConn, remoteConn)
+		io.Copy(local, remote)
 		done <- struct{}{}
 	}()
 
-	<-done
+	// Wait for either direction to finish, or context cancellation.
+	// On context cancel, deferred Close calls will unblock the io.Copy goroutines.
+	select {
+	case <-done:
+	case <-t.ctx.Done():
+	}
 }
 
-// Disconnect closes all tunnels and the SSH connection
-func (st *SiteTunnel) Disconnect() error {
-	st.cancel()
+// Stop cancels the tunnel, closes the listener, and waits up to 5 seconds
+// for active forwarded connections to drain.
+func (t *Tunnel) Stop() error {
+	t.cancel()
 
-	// Close all listeners
-	for _, listener := range st.listeners {
-		listener.Close()
+	if t.listener != nil {
+		t.listener.Close()
 	}
 
-	// Wait for all forwards to finish
-	st.wg.Wait()
+	// Wait for active connections to drain, up to 5 seconds.
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
 
-	// Close SSH connection
-	if st.client != nil {
-		st.client.Close()
+	for {
+		if atomic.LoadInt64(&t.connCount) == 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			// Timed out waiting for connections to drain.
+			t.Status = StatusDisconnected
+			return fmt.Errorf("tunnel: %d connections still active after 5s drain timeout on port %d",
+				atomic.LoadInt64(&t.connCount), t.LocalPort)
+		case <-ticker.C:
+			continue
+		}
 	}
 
-	// Update all tunnel statuses
-	st.mu.Lock()
-	for _, info := range st.tunnels {
-		info.Status = StatusDisconnected
-		st.notifyStatus(info)
-	}
-	st.mu.Unlock()
-
+	t.Status = StatusDisconnected
 	return nil
 }
 
-// GetTunnels returns all tunnel info
-func (st *SiteTunnel) GetTunnels() []*TunnelInfo {
-	st.mu.RLock()
-	defer st.mu.RUnlock()
-
-	tunnels := make([]*TunnelInfo, 0, len(st.tunnels))
-	for _, info := range st.tunnels {
-		tunnels = append(tunnels, info)
-	}
-	return tunnels
-}
-
-// IsConnected returns true if the SSH connection is active
-func (st *SiteTunnel) IsConnected() bool {
-	return st.client != nil
-}
-
-// ExecuteCommand runs a command on the gateway and returns output
-func (st *SiteTunnel) ExecuteCommand(cmd string) (string, error) {
-	if st.client == nil {
-		return "", fmt.Errorf("not connected to gateway")
-	}
-
-	session, err := st.client.NewSession()
-	if err != nil {
-		return "", fmt.Errorf("failed to create session: %w", err)
-	}
-	defer session.Close()
-
-	output, err := session.CombinedOutput(cmd)
-	if err != nil {
-		return string(output), fmt.Errorf("command failed: %w", err)
-	}
-
-	return string(output), nil
-}
-
-// DialWithTimeout attempts to connect to a remote host:port through the SSH tunnel
-// Returns true if the connection succeeds (port is open), false otherwise
-func (st *SiteTunnel) DialWithTimeout(host string, port int, timeout time.Duration) bool {
-	if st.client == nil {
-		return false
-	}
-
-	// Create a channel to signal completion
-	done := make(chan bool, 1)
-
-	go func() {
-		addr := fmt.Sprintf("%s:%d", host, port)
-		conn, err := st.client.Dial("tcp", addr)
-		if err != nil {
-			done <- false
-			return
-		}
-		conn.Close()
-		done <- true
-	}()
-
-	// Wait for either completion or timeout
-	select {
-	case result := <-done:
-		return result
-	case <-time.After(timeout):
-		return false
-	}
+// ActiveConnections returns the number of currently active forwarded connections.
+func (t *Tunnel) ActiveConnections() int64 {
+	return atomic.LoadInt64(&t.connCount)
 }

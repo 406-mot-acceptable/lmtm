@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/jaco/tunneler/internal/cli"
+	"github.com/406-mot-acceptable/lmtm/internal/app"
 )
 
 func main() {
-	if err := cli.Execute(); err != nil {
+	if err := app.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

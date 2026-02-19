@@ -1,64 +1,22 @@
-.PHONY: build run clean install deps test
+.PHONY: build clean run all
 
-# Binary name
-BINARY_NAME=tunneler
-BUILD_DIR=./bin
+BINARY  = lmtm
+VERSION = $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS = -s -w
 
-# Build the application
 build:
-	@echo "Building $(BINARY_NAME)..."
-	@mkdir -p $(BUILD_DIR)
-	@go build -o $(BUILD_DIR)/$(BINARY_NAME) cmd/tunneler/main.go
-	@echo "✓ Built: $(BUILD_DIR)/$(BINARY_NAME)"
+	go build -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/tunneler
 
-# Build with optimizations (smaller binary)
-release:
-	@echo "Building release version..."
-	@mkdir -p $(BUILD_DIR)
-	@go build -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY_NAME) cmd/tunneler/main.go
-	@echo "✓ Built release: $(BUILD_DIR)/$(BINARY_NAME)"
+run:
+	go run ./cmd/tunneler
 
-# Run the application
-run: build
-	@$(BUILD_DIR)/$(BINARY_NAME)
-
-# Install dependencies
-deps:
-	@echo "Installing dependencies..."
-	@go get github.com/spf13/cobra@latest
-	@go get github.com/charmbracelet/bubbletea@latest
-	@go get github.com/charmbracelet/bubbles@latest
-	@go get github.com/charmbracelet/lipgloss@latest
-	@go get golang.org/x/crypto/ssh@latest
-	@go get golang.org/x/term@latest
-	@go get gopkg.in/yaml.v3@latest
-	@go mod tidy
-	@echo "✓ Dependencies installed"
-
-# Clean build artifacts
 clean:
-	@echo "Cleaning..."
-	@rm -rf $(BUILD_DIR)
-	@go clean
-	@echo "✓ Cleaned"
+	rm -f $(BINARY) $(BINARY)-*
 
-# Install to system
-install: release
-	@echo "Installing to /usr/local/bin..."
-	@sudo cp $(BUILD_DIR)/$(BINARY_NAME) /usr/local/bin/
-	@echo "✓ Installed to /usr/local/bin/$(BINARY_NAME)"
-
-# Run tests
-test:
-	@go test -v ./...
-
-# Show help
-help:
-	@echo "Available targets:"
-	@echo "  make build    - Build the application"
-	@echo "  make release  - Build optimized release version"
-	@echo "  make run      - Build and run the application"
-	@echo "  make deps     - Install dependencies"
-	@echo "  make clean    - Clean build artifacts"
-	@echo "  make install  - Install to /usr/local/bin"
-	@echo "  make test     - Run tests"
+# Cross-compile for all platforms.
+all: clean
+	GOOS=linux   GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BINARY)-linux-amd64   ./cmd/tunneler
+	GOOS=linux   GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BINARY)-linux-arm64   ./cmd/tunneler
+	GOOS=darwin  GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BINARY)-darwin-amd64  ./cmd/tunneler
+	GOOS=darwin  GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BINARY)-darwin-arm64  ./cmd/tunneler
+	GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BINARY)-windows-amd64.exe ./cmd/tunneler

@@ -1,20 +1,19 @@
-# Binaries
+# Binary
+lmtm
+lmtm-*
+tunneler
 /bin/
-/tunneler
+
+# Go
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-
-# Test binary, built with `go test -c`
 *.test
-
-# Output of the go coverage tool
 *.out
-
-# Go workspace file
 go.work
+vendor/
 
 # IDE
 .vscode/
@@ -27,7 +26,8 @@ go.work
 .DS_Store
 Thumbs.db
 
-# Config files (except example)
-tunneler.yaml
-config.yaml
-!example.yaml
+# Obsidian
+.obsidian/
+
+# Claude
+.claude/
