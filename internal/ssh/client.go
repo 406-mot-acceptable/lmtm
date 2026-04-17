@@ -35,6 +35,10 @@ func NewClient() *Client {
 // Connect establishes an SSH connection using password authentication.
 // If hostKeyAlgos is non-nil, it restricts the host key algorithms
 // (needed for Ubiquiti devices that require ssh-rsa).
+//
+// The underlying TCP connection has OS-level keepalive enabled to maintain
+// the connection through NAT and detect network death without sending SSH
+// global requests (which can crash embedded SSH servers like Ubiquiti's).
 func (c *Client) Connect(host, port, user, password string, hostKeyAlgos []string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -61,11 +65,29 @@ func (c *Client) Connect(host, port, user, password string, hostKeyAlgos []strin
 		config.HostKeyAlgorithms = hostKeyAlgos
 	}
 
-	conn, err := gossh.Dial("tcp", addr, config)
+	// Dial TCP manually so we can enable OS-level keepalive.
+	// This keeps the connection alive through NAT without sending SSH
+	// global requests that can destabilize embedded SSH servers.
+	tcpConn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
 		c.zeroPassword()
 		return fmt.Errorf("ssh: connect to %s: %w", addr, err)
 	}
+
+	if tc, ok := tcpConn.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	// SSH handshake over the existing TCP connection.
+	sshConn, chans, reqs, err := gossh.NewClientConn(tcpConn, addr, config)
+	if err != nil {
+		tcpConn.Close()
+		c.zeroPassword()
+		return fmt.Errorf("ssh: connect to %s: %w", addr, err)
+	}
+
+	conn := gossh.NewClient(sshConn, chans, reqs)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	c.conn = conn
@@ -166,6 +188,7 @@ func (c *Client) StartKeepalive(interval time.Duration) {
 	c.mu.RUnlock()
 
 	go func() {
+		log := tunnelLog()
 		failures := 0
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -173,6 +196,7 @@ func (c *Client) StartKeepalive(interval time.Duration) {
 		for {
 			select {
 			case <-c.ctx.Done():
+				log.Printf("keepalive: context cancelled, exiting")
 				return
 			case <-ticker.C:
 				c.mu.RLock()
@@ -180,21 +204,28 @@ func (c *Client) StartKeepalive(interval time.Duration) {
 				c.mu.RUnlock()
 
 				if conn == nil {
+					log.Printf("keepalive: conn is nil, exiting")
 					return
 				}
 
 				// SendRequest on the connection sends a global request.
 				// "keepalive@openssh.com" is widely supported.
-				_, _, err := conn.SendRequest("keepalive@openssh.com", true, nil)
+				ok, _, err := conn.SendRequest("keepalive@openssh.com", true, nil)
 				if err != nil {
 					failures++
+					log.Printf("keepalive: FAILED (%d/3): %v", failures, err)
 					if failures >= 3 {
 						c.mu.Lock()
 						c.connected = false
 						c.mu.Unlock()
+						log.Printf("keepalive: marking connection as disconnected")
 						return
 					}
 				} else {
+					if failures > 0 {
+						log.Printf("keepalive: recovered after %d failures", failures)
+					}
+					log.Printf("keepalive: ok=%v", ok)
 					failures = 0
 				}
 			}

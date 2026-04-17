@@ -34,6 +34,8 @@ func PortBase(remotePort int) int {
 		return 2230
 	case 554:
 		return 5540
+	case 8291:
+		return 1110
 	default:
 		return 10000 + remotePort*10
 	}

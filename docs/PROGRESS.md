@@ -270,3 +270,49 @@ The application is ready for demo testing with real MikroTik and Ubiquiti gatewa
 10. `q` disconnects cleanly, exits
 
 Also works with Ubiquiti EdgeRouter (ssh-rsa fallback).
+
+---
+
+## 2026-03-11 -- Ubiquiti SSH Keepalive Bug Fix
+
+### Bug Report
+
+Tunnels to devices behind a Ubiquiti gateway (192.168.202.21) would fail with `PR_END_OF_FILE_ERROR` in the browser. Tunnels showed as [active] in the TUI but the underlying SSH connection was dead. Vanilla `ssh -L` to the same gateway worked reliably.
+
+### Diagnosis
+
+Added debug logging to `internal/ssh/tunnel.go` (`forward()` function) and `internal/ssh/client.go` (`StartKeepalive()`). Log output to `~/.lmtm/tunnel.log` revealed the exact failure sequence:
+
+1. Multiple SSH channels forwarding data successfully (browser loading pages)
+2. `StartKeepalive()` fires `conn.SendRequest("keepalive@openssh.com", true, nil)`
+3. Ubiquiti SSH server receives the global request while handling channel data under load
+4. SSH server drops the TCP connection (EOF)
+5. All subsequent `client.Dial()` calls fail with "use of closed network connection"
+6. `forward()` silently closed the accepted browser connections -> `PR_END_OF_FILE_ERROR`
+
+### Root Cause
+
+Ubiquiti's embedded SSH server cannot handle SSH global requests (`keepalive@openssh.com` with `wantReply=true`) while simultaneously forwarding data on multiple channels. The global request crashes or overwhelms the server, causing it to drop the entire TCP connection.
+
+### Fix
+
+**`internal/ssh/client.go` -- Connect():** Replaced `gossh.Dial()` with manual TCP dial + `gossh.NewClientConn()`. The manually-dialed TCP socket has OS-level keepalive enabled (`SetKeepAlive(true)`, `SetKeepAlivePeriod(30s)`). TCP keepalive is handled by the kernel, completely invisible to the SSH server.
+
+**`internal/tui/app.go` -- connectCmd():** Removed `client.StartKeepalive(30 * time.Second)` call. The SSH-level keepalive (global request) is no longer used. TCP keepalive handles NAT traversal and dead connection detection at the transport layer.
+
+**`internal/ssh/log.go` + tunnel.go + client.go:** Added tunnel debug logging to `~/.lmtm/tunnel.log`. Logs connection accept/connect, dial failures, bytes transferred, copy errors, and keepalive events. The log file is created on first tunnel use.
+
+### Files Changed
+
+- `internal/ssh/client.go` -- TCP keepalive in Connect(), keepalive logging
+- `internal/ssh/tunnel.go` -- forward() debug logging
+- `internal/ssh/log.go` -- new file, tunnel logger to ~/.lmtm/tunnel.log
+- `internal/tui/app.go` -- removed StartKeepalive() call
+- `docs/DECISIONS.md` -- decisions 024 (TCP keepalive) and 025 (tunnel logging)
+- `docs/KANBAN.md` -- tasks marked done
+- `docs/PROGRESS.md` -- this entry
+
+### Decisions Recorded
+
+- **024:** TCP keepalive instead of SSH global request keepalive
+- **025:** Tunnel debug logging to ~/.lmtm/tunnel.log

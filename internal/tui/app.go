@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -68,6 +69,9 @@ type AppModel struct {
 	gatewayAddr string
 	gatewayType string
 	hostname    string
+
+	// Rescan merge state.
+	previousEntries []deviceEntry
 
 	// Error state.
 	lastErr error
@@ -257,7 +261,13 @@ func (m AppModel) updateScanning(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Scan finished successfully with devices.
 		doneMsg := ScanDoneMsg{DevicesFound: len(msg.devices)}
 		m.scan, _ = m.scan.Update(doneMsg)
-		m.devices = NewDevicesModel(msg.devices)
+		if m.previousEntries != nil {
+			merged := mergeEntries(m.previousEntries, msg.devices)
+			m.devices = NewDevicesModelFromEntries(merged)
+			m.previousEntries = nil
+		} else {
+			m.devices = NewDevicesModel(msg.devices)
+		}
 		m.state = stateDevices
 		return m, m.devices.Init()
 
@@ -276,10 +286,36 @@ func (m AppModel) updateScanning(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m AppModel) updateDevices(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case SubnetScanRequestMsg:
+		m.previousEntries = m.devices.Entries()
+		m.lanSubnet = msg.Subnet
+		m.scan = NewScanModel()
+		m.state = stateScanning
+		return m, tea.Batch(
+			m.scan.Init(),
+			m.scanCmd(),
+		)
+
 	case DeviceSelectMsg:
 		// Allocate ports and build tunnel specs.
 		m.allocator = portmap.NewPortAllocator()
 		var specs []ssh.TunnelSpec
+
+		// Auto-forward WinBox (8291) on MikroTik gateways.
+		if m.gatewayType == "MikroTik" {
+			host := m.gatewayAddr
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				host = h
+			}
+			if lp, err := m.allocator.Allocate(host, 8291); err == nil {
+				specs = append(specs, ssh.TunnelSpec{
+					RemoteHost: host,
+					RemotePort: 8291,
+					LocalPort:  lp,
+				})
+			}
+		}
+
 		for _, d := range msg.Devices {
 			for _, port := range d.Ports {
 				localPort, err := m.allocator.Allocate(d.IP, port)
@@ -386,6 +422,15 @@ func (m AppModel) handleBack() (tea.Model, tea.Cmd) {
 	case stateSurvey:
 		return m.disconnect()
 	case stateDevices:
+		// If in an input mode, cancel it first.
+		if m.devices.mode != modeList {
+			m.devices.mode = modeList
+			m.devices.inputErr = ""
+			m.devices.subnetInput.Blur()
+			m.devices.ipInput.Blur()
+			m.devices.portInput.Blur()
+			return m, nil
+		}
 		// Go back to survey.
 		m.state = stateSurvey
 		return m, nil
@@ -412,7 +457,10 @@ func (m AppModel) connectCmd(host, user, pass string) tea.Cmd {
 			}
 		}
 
-		client.StartKeepalive(30 * time.Second)
+		// NOTE: No SSH-level keepalive. OS-level TCP keepalive is enabled
+		// in Connect() and is transparent to the SSH server. Ubiquiti's
+		// embedded SSH server drops connections when it receives SSH global
+		// requests (keepalive@openssh.com) under channel forwarding load.
 
 		// Detect gateway type.
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

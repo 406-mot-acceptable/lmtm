@@ -171,6 +171,7 @@ The codebase is a single-person project built in a few focused sessions. It work
 - [ ] Manual device entry (custom IP + port when scan finds nothing)
 - [ ] Reconnect failed tunnels without restarting
 - [ ] Custom port override per device
+- [ ] Vendor-aware port presets (e.g. auto-forward 8291 for MikroTik, 554 for Hikvision)
 - [ ] Additional gateway types (generic Linux, OpenWrt)
 
 ## Dependencies

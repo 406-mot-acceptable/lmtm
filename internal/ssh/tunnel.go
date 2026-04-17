@@ -124,23 +124,31 @@ func (t *Tunnel) forward(local net.Conn) {
 	defer local.Close()
 
 	remoteAddr := fmt.Sprintf("%s:%d", t.RemoteHost, t.RemotePort)
+	log := tunnelLog()
+	log.Printf("fwd: accept on :%d -> dial %s", t.LocalPort, remoteAddr)
+
 	remote, err := t.client.Dial("tcp", remoteAddr)
 	if err != nil {
+		log.Printf("fwd: DIAL FAILED :%d -> %s: %v", t.LocalPort, remoteAddr, err)
 		return
 	}
 	defer remote.Close()
+
+	log.Printf("fwd: connected :%d -> %s", t.LocalPort, remoteAddr)
 
 	// Bidirectional copy: two goroutines, done when either direction finishes.
 	// Buffer of 2 so neither goroutine blocks on send after the function returns.
 	done := make(chan struct{}, 2)
 
 	go func() {
-		io.Copy(remote, local)
+		n, err := io.Copy(remote, local)
+		log.Printf("fwd: local->remote :%d -> %s: %d bytes, err=%v", t.LocalPort, remoteAddr, n, err)
 		done <- struct{}{}
 	}()
 
 	go func() {
-		io.Copy(local, remote)
+		n, err := io.Copy(local, remote)
+		log.Printf("fwd: remote->local :%d <- %s: %d bytes, err=%v", t.LocalPort, remoteAddr, n, err)
 		done <- struct{}{}
 	}()
 
@@ -148,7 +156,9 @@ func (t *Tunnel) forward(local net.Conn) {
 	// On context cancel, deferred Close calls will unblock the io.Copy goroutines.
 	select {
 	case <-done:
+		log.Printf("fwd: one direction done :%d <-> %s, closing", t.LocalPort, remoteAddr)
 	case <-t.ctx.Done():
+		log.Printf("fwd: context cancelled :%d <-> %s", t.LocalPort, remoteAddr)
 	}
 }
 

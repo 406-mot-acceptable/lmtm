@@ -6,8 +6,9 @@ kanban-plugin: basic
 
 ## Backlog
 
-- [ ] Manual device entry -- custom LAN IP + port when scan finds nothing @tui @backend
-- [ ] Push to GitHub (init repo, .gitignore, commit, create remote)
+- [ ] Fix Ubiquiti FloodPing bash-isms for airOS BusyBox ash compatibility @compatibility
+- [ ] Add per-host timeout to MikroTik FloodPing ping loop (timeout=100ms) @compatibility
+- [ ] Active tunnel view has no scroll -- tunnels at top are clipped when list exceeds terminal height @tui
 
 ## In Progress
 
@@ -58,5 +59,9 @@ kanban-plugin: basic
 - [x] Quick polish -- preset hint, build summary, spinner colors @tui
 - [x] Fix Ubiquiti airOS 8 LAN/WAN detection (system.cfg + ifconfig + arp) @compatibility
 - [x] Tested on MikroTik + Ubiquiti airOS 8 gateways @all
+- [x] Subnet scan + manual IP:Port entry on devices screen @tui @backend
+- [x] Vendor-aware port presets -- MikroTik/Routerboard auto-forward WinBox 8291 @backend @compatibility
+- [x] Fix Ubiquiti SSH keepalive crash -- replace SSH global request with TCP keepalive @security @compatibility
+- [x] Add tunnel debug logging to ~/.lmtm/tunnel.log @security @backend
 
 ## Blocked

@@ -298,3 +298,32 @@ Each entry captures what was decided, why, and what alternatives were considered
 - Trust the caller (subnet always comes from gateway) -- rejected, violates defense in depth
 - Parameterized command execution -- not available on MikroTik RouterOS proprietary CLI
 - Separate subnet type with parse-time validation -- rejected, over-engineered for a single validation point
+
+---
+
+## 024 -- TCP keepalive instead of SSH global request keepalive
+
+**Decision:** Replace the SSH-level keepalive (`keepalive@openssh.com` global request) with OS-level TCP keepalive (`SetKeepAlive(true)` + `SetKeepAlivePeriod(30s)`) on the underlying TCP connection. The SSH connection is established over a manually-dialed TCP socket instead of using `gossh.Dial`.
+
+**Rationale:** Ubiquiti's embedded SSH server drops the connection when it receives SSH global requests (`keepalive@openssh.com` with `wantReply=true`) while simultaneously handling multiple forwarded channels under load. This was confirmed in production: the keepalive request caused an immediate EOF on the SSH connection, killing all active tunnels. TCP keepalive achieves the same goals (NAT traversal, dead connection detection) at the transport layer, completely invisible to the SSH server.
+
+**Diagnosis:** Tunnel debug logging (`~/.lmtm/tunnel.log`) showed the sequence: multiple channels forwarding data successfully -> keepalive fires -> EOF -> all subsequent channel dials fail with "use of closed network connection". Vanilla `ssh -L` (which does not send global requests during forwarding) worked reliably against the same gateway.
+
+**Alternatives Considered:**
+- SSH global request with `wantReply=false` -- rejected, cannot detect dead connections without a reply
+- Session-based keepalive (open session, exec `true`, close) -- rejected, creates additional channels which may also stress embedded SSH servers
+- Disable keepalive entirely -- rejected, need dead connection detection and NAT traversal
+- Higher failure threshold (e.g., 10 failures) -- rejected, treats the symptom not the cause
+
+---
+
+## 025 -- Tunnel debug logging to ~/.lmtm/tunnel.log
+
+**Decision:** The SSH tunnel subsystem (`internal/ssh/`) logs forwarding events and errors to `~/.lmtm/tunnel.log`. The log file is created on first use and appended to for the process lifetime. Log entries include: connection accept/connect, dial failures, bytes transferred per direction, copy errors, and connection close reasons.
+
+**Rationale:** SSH tunnel failures are invisible to the user -- the TUI shows tunnels as [active] (listener is up) even when the underlying SSH connection is dead. Browser errors like `PR_END_OF_FILE_ERROR` give no indication of root cause. The log file provides a diagnostic trail for debugging tunnel issues without cluttering the TUI. Introduced during investigation of Ubiquiti keepalive bug (see decision 024).
+
+**Alternatives Considered:**
+- Log to stderr -- rejected, Bubbletea captures stderr for TUI rendering
+- TUI-visible error messages -- rejected, too noisy for normal operation (browsers open/close connections speculatively)
+- No logging -- rejected, tunnel failures are otherwise completely silent

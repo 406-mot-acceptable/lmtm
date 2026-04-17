@@ -44,7 +44,7 @@ func (c DeviceClass) DefaultPorts() []int {
 	case ClassNVR:
 		return []int{22, 80, 443, 554}
 	case ClassRouter:
-		return []int{22, 80, 443}
+		return []int{22, 80, 443, 8291}
 	case ClassNetworkDevice:
 		return []int{22, 80, 443}
 	case ClassServer:

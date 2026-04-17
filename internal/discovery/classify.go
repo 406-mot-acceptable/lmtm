@@ -25,7 +25,7 @@ func ClassifyByVendor(vendor string) DeviceClass {
 	}
 
 	// Routers
-	if strings.Contains(v, "mikrotik") {
+	if strings.Contains(v, "mikrotik") || strings.Contains(v, "routerboard") {
 		return ClassRouter
 	}
 
