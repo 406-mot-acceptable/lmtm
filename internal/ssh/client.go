@@ -58,7 +58,7 @@ func (c *Client) Connect(host, port, user, password string, hostKeyAlgos []strin
 			gossh.Password(password),
 		},
 		HostKeyCallback: c.hostKeyCallback(host),
-		Timeout:         10 * time.Second,
+		Timeout:         30 * time.Second,
 	}
 
 	if len(hostKeyAlgos) > 0 {
@@ -68,7 +68,8 @@ func (c *Client) Connect(host, port, user, password string, hostKeyAlgos []strin
 	// Dial TCP manually so we can enable OS-level keepalive.
 	// This keeps the connection alive through NAT without sending SSH
 	// global requests that can destabilize embedded SSH servers.
-	tcpConn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	// 30s timeout accommodates slow/distant gateways (international links).
+	tcpConn, err := net.DialTimeout("tcp", addr, 30*time.Second)
 	if err != nil {
 		c.zeroPassword()
 		return fmt.Errorf("ssh: connect to %s: %w", addr, err)
@@ -84,8 +85,10 @@ func (c *Client) Connect(host, port, user, password string, hostKeyAlgos []strin
 	if err != nil {
 		tcpConn.Close()
 		c.zeroPassword()
+		tunnelLog().Printf("connect: handshake to %s failed (algos=%v): %v", addr, hostKeyAlgos, err)
 		return fmt.Errorf("ssh: connect to %s: %w", addr, err)
 	}
+	tunnelLog().Printf("connect: handshake to %s OK (algos=%v)", addr, hostKeyAlgos)
 
 	conn := gossh.NewClient(sshConn, chans, reqs)
 
