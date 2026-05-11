@@ -447,13 +447,29 @@ func (m AppModel) connectCmd(host, user, pass string) tea.Cmd {
 	return func() tea.Msg {
 		client := ssh.NewClient()
 
-		// Try connecting. If it fails with default algos, retry with ssh-rsa for Ubiquiti.
-		err := client.Connect(host, "22", user, pass, nil)
+		// Permissive host-key algorithms cover both modern (rsa-sha2-*) and
+		// legacy (ssh-rsa) servers in a single handshake. Go x/crypto/ssh
+		// dropped ssh-rsa from its defaults; some MikroTik/Ubiquiti firmwares
+		// still only present an ssh-rsa host key, which is why bare ssh works
+		// with -o HostKeyAlgorithms=ssh-rsa.
+		permissiveAlgos := []string{
+			"rsa-sha2-512",
+			"rsa-sha2-256",
+			"ssh-ed25519",
+			"ecdsa-sha2-nistp256",
+			"ecdsa-sha2-nistp384",
+			"ecdsa-sha2-nistp521",
+			"ssh-rsa",
+		}
+
+		err := client.Connect(host, "22", user, pass, permissiveAlgos)
 		if err != nil {
-			// Retry with ssh-rsa host key algorithm for Ubiquiti devices.
+			// Fallback: ssh-rsa-only in case the broader list confuses the
+			// server. Surface the fallback error if both attempts fail —
+			// it's the more actionable of the two.
 			client = ssh.NewClient()
 			if err2 := client.Connect(host, "22", user, pass, []string{"ssh-rsa"}); err2 != nil {
-				return DetectDoneMsg{Err: fmt.Errorf("connection failed: %w", err)}
+				return DetectDoneMsg{Err: fmt.Errorf("connection failed: %w (first attempt: %v)", err2, err)}
 			}
 		}
 
