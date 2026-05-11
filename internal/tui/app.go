@@ -73,6 +73,10 @@ type AppModel struct {
 	// Rescan merge state.
 	previousEntries []deviceEntry
 
+	// Per-device MAC lookup, indexed by RemoteHost, populated when the user
+	// confirms device selection. Used to label tunnel groups in the dashboard.
+	macByHost map[string]string
+
 	// Error state.
 	lastErr error
 
@@ -107,10 +111,16 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Handle window size.
-	if msg, ok := msg.(tea.WindowSizeMsg); ok {
-		m.width = msg.Width
-		m.height = msg.Height
+	// Handle window size. Track the dimensions on the AppModel and also
+	// forward to the active tunnels view so its viewport resizes live.
+	if wsm, ok := msg.(tea.WindowSizeMsg); ok {
+		m.width = wsm.Width
+		m.height = wsm.Height
+		if m.state == stateTunnels {
+			var cmd tea.Cmd
+			m.tunnels, cmd = m.tunnels.Update(wsm)
+			return m, cmd
+		}
 		return m, nil
 	}
 
@@ -301,6 +311,10 @@ func (m AppModel) updateDevices(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.allocator = portmap.NewPortAllocator()
 		var specs []ssh.TunnelSpec
 
+		// Capture MAC addresses by RemoteHost so the tunnel dashboard can
+		// label each device. Gateway auto-tunnels (e.g. WinBox) have no MAC.
+		m.macByHost = make(map[string]string, len(msg.Devices))
+
 		// Auto-forward WinBox (8291) on MikroTik gateways.
 		if m.gatewayType == "MikroTik" {
 			host := m.gatewayAddr
@@ -317,6 +331,9 @@ func (m AppModel) updateDevices(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		for _, d := range msg.Devices {
+			if d.MAC != "" {
+				m.macByHost[d.IP] = d.MAC
+			}
 			for _, port := range d.Ports {
 				localPort, err := m.allocator.Allocate(d.IP, port)
 				if err != nil {
@@ -375,7 +392,7 @@ func (m AppModel) updateBuilding(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case transitionToTunnelsMsg:
 		tunnels := m.manager.Tunnels()
 		tmsg := msg.(transitionToTunnelsMsg)
-		m.tunnels = NewTunnelsModel(tunnels)
+		m.tunnels = NewTunnelsModel(tunnels, m.macByHost, m.width, m.height)
 		m.tunnels.milestone = tmsg.milestone
 		m.state = stateTunnels
 		return m, m.tunnels.Init()
@@ -606,6 +623,7 @@ func (m AppModel) disconnect() (tea.Model, tea.Cmd) {
 	m.scanner = nil
 	m.allocator = nil
 	m.lanSubnet = ""
+	m.macByHost = nil
 
 	m.connect = NewConnectModel()
 	m.state = stateConnect
